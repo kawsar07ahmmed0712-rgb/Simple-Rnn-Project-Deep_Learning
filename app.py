@@ -4,18 +4,37 @@ import glob
 import numpy as np
 import tensorflow as tf
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
 from tensorflow.keras.datasets import imdb
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing import sequence
 from tensorflow.keras.preprocessing.text import text_to_word_sequence
 
 
-app = Flask(__name__)
+# ============================================================
+# Flask App
+# ============================================================
 
+app = Flask(__name__)
+CORS(app)
+
+
+# ============================================================
+# Configuration
+# ============================================================
 
 DEFAULT_MAX_LEN = 500
 DEFAULT_MAX_FEATURES = 10000
+
+# Higher temperature makes overconfident scores softer.
+# Example:
+# raw 0.99 -> display around 0.82
+# raw 0.01 -> display around 0.18
+DISPLAY_TEMPERATURE = 3.0
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MODEL_CANDIDATES = [
     "best_simple_rnn_imdb.keras",
@@ -28,6 +47,10 @@ MODEL_CANDIDATES = [
 ]
 
 
+# ============================================================
+# Global Variables
+# ============================================================
+
 model = None
 word_index = None
 model_path = None
@@ -35,18 +58,42 @@ max_len = DEFAULT_MAX_LEN
 max_features = DEFAULT_MAX_FEATURES
 
 
-def find_model_file():
-    for candidate in MODEL_CANDIDATES:
-        if os.path.exists(candidate):
-            return candidate
+# ============================================================
+# Find Model File
+# ============================================================
 
-    extra_models = glob.glob("*.keras") + glob.glob("*.h5")
+def find_model_file():
+    print("=" * 60)
+    print("Searching for model file...")
+    print("Current working directory:", os.getcwd())
+    print("Backend directory:", BASE_DIR)
+    print("=" * 60)
+
+    for candidate in MODEL_CANDIDATES:
+        full_path = os.path.join(BASE_DIR, candidate)
+
+        print("Checking:", full_path)
+
+        if os.path.exists(full_path):
+            print("Model found:", full_path)
+            return full_path
+
+    extra_models = (
+        glob.glob(os.path.join(BASE_DIR, "*.keras")) +
+        glob.glob(os.path.join(BASE_DIR, "*.h5"))
+    )
 
     if len(extra_models) > 0:
+        print("Model found:", extra_models[0])
         return extra_models[0]
 
+    print("No model file found.")
     return None
 
+
+# ============================================================
+# Detect Model Max Length
+# ============================================================
 
 def get_model_max_len(loaded_model):
     try:
@@ -62,9 +109,14 @@ def get_model_max_len(loaded_model):
 
         return int(detected_len)
 
-    except Exception:
+    except Exception as error:
+        print("Could not detect max_len:", error)
         return DEFAULT_MAX_LEN
 
+
+# ============================================================
+# Detect Vocabulary Size
+# ============================================================
 
 def get_model_vocab_size(loaded_model):
     try:
@@ -74,9 +126,14 @@ def get_model_vocab_size(loaded_model):
 
         return DEFAULT_MAX_FEATURES
 
-    except Exception:
+    except Exception as error:
+        print("Could not detect vocab size:", error)
         return DEFAULT_MAX_FEATURES
 
+
+# ============================================================
+# Initialize App
+# ============================================================
 
 def initialize_app():
     global model, word_index, model_path, max_len, max_features
@@ -84,32 +141,51 @@ def initialize_app():
     print("Loading IMDB word index...")
     word_index = imdb.get_word_index()
 
-    print("Searching for model file...")
     model_path = find_model_file()
 
     if model_path is None:
         print("WARNING: No model file found.")
-        print("The app will run in demo fallback mode.")
+        print("The API will run in demo fallback mode.")
         model = None
         return
 
-    print(f"Loading model: {model_path}")
-    model = load_model(model_path, compile=False)
+    try:
+        print("Loading model:", model_path)
 
-    max_len = get_model_max_len(model)
-    max_features = get_model_vocab_size(model)
+        model = load_model(model_path, compile=False)
 
-    print("Model loaded successfully.")
-    print(f"Model file: {model_path}")
-    print(f"Max sequence length: {max_len}")
-    print(f"Vocabulary size: {max_features}")
+        max_len = get_model_max_len(model)
+        max_features = get_model_vocab_size(model)
 
+        print("=" * 60)
+        print("Model loaded successfully.")
+        print("Model file:", os.path.basename(model_path))
+        print("Model full path:", model_path)
+        print("Max sequence length:", max_len)
+        print("Vocabulary size:", max_features)
+        print("Display temperature:", DISPLAY_TEMPERATURE)
+        print("=" * 60)
+
+    except Exception as error:
+        print("ERROR: Could not load model.")
+        print(error)
+        print("The API will run in demo fallback mode.")
+        model = None
+
+
+# ============================================================
+# Text Cleaning
+# ============================================================
 
 def clean_text(text):
     text = text.strip()
     text = re.sub(r"\s+", " ", text)
     return text
 
+
+# ============================================================
+# Text Preprocessing
+# ============================================================
 
 def preprocess_text(text):
     """
@@ -123,6 +199,7 @@ def preprocess_text(text):
     """
 
     text = clean_text(text)
+
     tokens = text_to_word_sequence(text)
 
     encoded_review = [1]
@@ -150,22 +227,50 @@ def preprocess_text(text):
     return padded_review, tokens, encoded_review
 
 
-def fallback_demo_prediction(text):
+# ============================================================
+# Probability Calibration / Confidence Softening
+# ============================================================
+
+def soften_probability(probability, temperature=3.0):
     """
-    This is only used when no .h5 or .keras model file is found.
-    It lets your website UI still work for testing.
+    Temperature scaling for display confidence.
+
+    This does NOT change the model decision direction.
+    It only softens overconfident sigmoid outputs for better UI display.
+
+    temperature = 1.0 means no change.
+    temperature > 1.0 makes 0.99 closer to around 0.80.
     """
 
+    probability = float(probability)
+
+    # Avoid log(0) or division by zero
+    probability = max(1e-7, min(1 - 1e-7, probability))
+
+    logit = np.log(probability / (1 - probability))
+    softened_logit = logit / temperature
+    softened_probability = 1 / (1 + np.exp(-softened_logit))
+
+    return float(softened_probability)
+
+
+# ============================================================
+# Demo Fallback Prediction
+# Only used if model file is not found or model cannot load
+# ============================================================
+
+def fallback_demo_prediction(text):
     positive_words = [
         "amazing", "excellent", "great", "good", "beautiful", "wonderful",
         "best", "love", "loved", "enjoyed", "brilliant", "perfect",
-        "masterpiece", "fantastic", "powerful", "emotional"
+        "masterpiece", "fantastic", "powerful", "emotional", "nice",
+        "satisfying", "recommend", "interesting", "strong", "fun"
     ]
 
     negative_words = [
         "bad", "boring", "terrible", "awful", "worst", "hate", "hated",
         "poor", "weak", "disappointing", "slow", "waste", "annoying",
-        "regret", "confusing", "predictable"
+        "regret", "confusing", "predictable", "dull", "messy", "flat"
     ]
 
     lower_text = text.lower()
@@ -176,43 +281,74 @@ def fallback_demo_prediction(text):
     score = 0.5 + (positive_count - negative_count) * 0.12
     score = max(0.03, min(0.97, score))
 
-    return score
+    return float(score)
 
+
+# ============================================================
+# Prediction Function
+# ============================================================
 
 def predict_review_sentiment(review_text):
     padded_review, tokens, encoded_review = preprocess_text(review_text)
 
     if model is None:
-        score = fallback_demo_prediction(review_text)
+        raw_score = fallback_demo_prediction(review_text)
         demo_mode = True
     else:
         prediction = model.predict(padded_review, verbose=0)
-        score = float(prediction[0][0])
+        raw_score = float(prediction[0][0])
         demo_mode = False
 
-    if score >= 0.5:
+    # Soften only for display
+    display_score = soften_probability(
+        raw_score,
+        temperature=DISPLAY_TEMPERATURE
+    )
+
+    # Same decision threshold
+    if display_score >= 0.5:
         sentiment = "Positive"
-        confidence = score
+        confidence = display_score
     else:
         sentiment = "Negative"
-        confidence = 1 - score
+        confidence = 1 - display_score
 
     return {
         "sentiment": sentiment,
-        "score": round(score, 6),
+
+        # This is the softened score for frontend display
+        "score": round(display_score, 6),
+
+        # This is the real model sigmoid output
+        "raw_score": round(raw_score, 6),
+
         "confidence": round(confidence * 100, 2),
         "word_count": len(tokens),
         "encoded_length": len(encoded_review),
         "max_len": max_len,
         "max_features": max_features,
-        "model_file": model_path if model_path else "No model file found",
-        "demo_mode": demo_mode
+        "model_loaded": model is not None,
+        "model_file": os.path.basename(model_path) if model_path else None,
+        "demo_mode": demo_mode,
+        "temperature_scaled": True,
+        "display_temperature": DISPLAY_TEMPERATURE
     }
 
 
-@app.route("/")
+# ============================================================
+# Routes
+# ============================================================
+
+@app.route("/", methods=["GET"])
 def home():
-    return render_template("index.html")
+    return jsonify({
+        "message": "IMDB Sentiment Flask API is running.",
+        "status": "ok",
+        "model_loaded": model is not None,
+        "model_file": os.path.basename(model_path) if model_path else None,
+        "temperature_scaled": True,
+        "display_temperature": DISPLAY_TEMPERATURE
+    })
 
 
 @app.route("/health", methods=["GET"])
@@ -220,9 +356,14 @@ def health():
     return jsonify({
         "status": "ok",
         "model_loaded": model is not None,
-        "model_file": model_path,
+        "model_file": os.path.basename(model_path) if model_path else None,
+        "model_full_path": model_path,
+        "backend_dir": BASE_DIR,
+        "current_working_dir": os.getcwd(),
         "max_len": max_len,
-        "max_features": max_features
+        "max_features": max_features,
+        "temperature_scaled": True,
+        "display_temperature": DISPLAY_TEMPERATURE
     })
 
 
@@ -239,7 +380,7 @@ def predict():
 
         review = data.get("review", "")
 
-        if review.strip() == "":
+        if not review or review.strip() == "":
             return jsonify({
                 "success": False,
                 "error": "Please enter a movie review."
@@ -259,7 +400,11 @@ def predict():
         }), 500
 
 
+# ============================================================
+# Run App
+# ============================================================
+
 initialize_app()
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, port=5000)
